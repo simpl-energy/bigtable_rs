@@ -90,6 +90,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_fn_traits::AsyncFn2;
 use futures_util::Stream;
 use gcp_auth::TokenProvider;
 use log::info;
@@ -197,6 +198,7 @@ pub struct BigTableConnection {
     table_prefix: Arc<String>,
     instance_prefix: Arc<String>,
     timeout: Arc<Option<Duration>>,
+    retry_on_failure: bool,
 }
 
 impl BigTableConnection {
@@ -328,6 +330,7 @@ impl BigTableConnection {
                     table_prefix: Arc::new(table_prefix),
                     instance_prefix: Arc::new(instance_prefix),
                     timeout: Arc::new(timeout),
+                    retry_on_failure: false,
                 })
             }
         }
@@ -400,6 +403,7 @@ impl BigTableConnection {
                 project_id, instance_name
             )),
             timeout: Arc::new(timeout),
+            retry_on_failure: false,
         })
     }
 
@@ -413,6 +417,7 @@ impl BigTableConnection {
             instance_prefix: self.instance_prefix.clone(),
             table_prefix: self.table_prefix.clone(),
             timeout: self.timeout.clone(),
+            retry_on_failure: self.retry_on_failure,
         }
     }
 
@@ -422,6 +427,12 @@ impl BigTableConnection {
         config_fn: fn(BigtableClient<AuthSvc>) -> BigtableClient<AuthSvc>,
     ) {
         self.client = config_fn(self.client.clone());
+    }
+
+    /// Set this to `true` to let the client automatically retry in case on an `RpcError`. The retry happens
+    /// immediately without any form of backoff, and comes at the cost of cloning the request before each call.
+    pub fn set_retry_on_failure(&mut self, retry_on_failure: bool) {
+        self.retry_on_failure = retry_on_failure;
     }
 }
 
@@ -468,17 +479,40 @@ pub struct BigTable {
     instance_prefix: Arc<String>,
     table_prefix: Arc<String>,
     timeout: Arc<Option<Duration>>,
+    retry_on_failure: bool,
 }
 
 impl BigTable {
+    /// Helper to run actions with a potential retry upon failure
+    async fn with_retry<F, A, R>(&mut self, f: F, a: A) -> std::result::Result<R, tonic::Status>
+    where
+        A: Clone,
+        F: for<'b> AsyncFn2<
+            &'b mut BigtableClient<AuthSvc>,
+            A,
+            Output = std::result::Result<R, tonic::Status>,
+        >,
+    {
+        if self.retry_on_failure {
+            // We might want to retry, so we clone the request first
+            let r = f(&mut self.client, a.clone()).await;
+            match r {
+                Err(_) => f(&mut self.client, a).await,
+                _ => r,
+            }
+        } else {
+            // No retry, so no cloning needed
+            f(&mut self.client, a).await
+        }
+    }
+
     /// Wrapped `check_and_mutate_row` method
     pub async fn check_and_mutate_row(
         &mut self,
         request: CheckAndMutateRowRequest,
     ) -> Result<CheckAndMutateRowResponse> {
         let response = self
-            .client
-            .check_and_mutate_row(request)
+            .with_retry(BigtableClient::check_and_mutate_row, request)
             .await?
             .into_inner();
         Ok(response)
@@ -489,7 +523,10 @@ impl BigTable {
         &mut self,
         request: ReadRowsRequest,
     ) -> Result<Vec<(RowKey, Vec<RowCell>)>> {
-        let response = self.client.read_rows(request).await?.into_inner();
+        let response = self
+            .with_retry(BigtableClient::read_rows, request)
+            .await?
+            .into_inner();
         decode_read_rows_response(self.timeout.as_ref(), response).await
     }
 
@@ -504,7 +541,10 @@ impl BigTable {
             row_keys: vec![], // use this field to put keys for reading specific rows
             row_ranges: vec![row_range],
         });
-        let response = self.client.read_rows(request).await?.into_inner();
+        let response = self
+            .with_retry(BigtableClient::read_rows, request)
+            .await?
+            .into_inner();
         decode_read_rows_response(self.timeout.as_ref(), response).await
     }
 
@@ -513,7 +553,10 @@ impl BigTable {
         &mut self,
         request: ReadRowsRequest,
     ) -> Result<impl Stream<Item = Result<(RowKey, Vec<RowCell>)>>> {
-        let response = self.client.read_rows(request).await?.into_inner();
+        let response = self
+            .with_retry(BigtableClient::read_rows, request)
+            .await?
+            .into_inner();
         let stream = decode_read_rows_response_stream(response).await;
         Ok(stream)
     }
@@ -529,7 +572,10 @@ impl BigTable {
             row_keys: vec![],
             row_ranges: vec![row_range],
         });
-        let response = self.client.read_rows(request).await?.into_inner();
+        let response = self
+            .with_retry(BigtableClient::read_rows, request)
+            .await?
+            .into_inner();
         let stream = decode_read_rows_response_stream(response).await;
         Ok(stream)
     }
@@ -539,7 +585,10 @@ impl BigTable {
         &mut self,
         request: SampleRowKeysRequest,
     ) -> Result<Streaming<SampleRowKeysResponse>> {
-        let response = self.client.sample_row_keys(request).await?.into_inner();
+        let response = self
+            .with_retry(BigtableClient::sample_row_keys, request)
+            .await?
+            .into_inner();
         Ok(response)
     }
 
@@ -548,7 +597,7 @@ impl BigTable {
         &mut self,
         request: MutateRowRequest,
     ) -> Result<Response<MutateRowResponse>> {
-        let response = self.client.mutate_row(request).await?;
+        let response = self.with_retry(BigtableClient::mutate_row, request).await?;
         Ok(response)
     }
 
@@ -557,7 +606,10 @@ impl BigTable {
         &mut self,
         request: MutateRowsRequest,
     ) -> Result<Streaming<MutateRowsResponse>> {
-        let response = self.client.mutate_rows(request).await?.into_inner();
+        let response = self
+            .with_retry(BigtableClient::mutate_rows, request)
+            .await?
+            .into_inner();
         Ok(response)
     }
 

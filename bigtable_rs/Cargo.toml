@@ -30,6 +30,7 @@ futures-util = "0.3.31"
 gcp_auth = "0.12.2"
 log = "0.4.20"
 thiserror = "2.0.3"
+async_fn_traits = "0.1.1"
 
 [features]
 default = ["tonic-tls-aws-lc"]
