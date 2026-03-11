@@ -93,7 +93,7 @@ use std::time::Duration;
 use async_fn_traits::AsyncFn2;
 use futures_util::Stream;
 use gcp_auth::TokenProvider;
-use log::info;
+use log::{info, warn};
 use thiserror::Error;
 use tokio::net::UnixStream;
 use tonic::metadata::MetadataValue;
@@ -488,16 +488,19 @@ impl BigTable {
     where
         A: Clone,
         F: for<'b> AsyncFn2<
-            &'b mut BigtableClient<AuthSvc>,
-            A,
-            Output = std::result::Result<R, tonic::Status>,
-        >,
+                &'b mut BigtableClient<AuthSvc>,
+                A,
+                Output = std::result::Result<R, tonic::Status>,
+            >,
     {
         if self.retry_on_failure {
             // We might want to retry, so we clone the request first
             let r = f(&mut self.client, a.clone()).await;
             match r {
-                Err(_) => f(&mut self.client, a).await,
+                Err(e) => {
+                    warn!("Retrying, got error {e:?}");
+                    f(&mut self.client, a).await
+                }
                 _ => r,
             }
         } else {
