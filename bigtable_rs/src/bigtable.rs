@@ -108,6 +108,7 @@ use tower::ServiceBuilder;
 
 use crate::auth_service::AuthSvc;
 use crate::bigtable::read_rows::{decode_read_rows_response, decode_read_rows_response_stream};
+use crate::util::RetryPolicy;
 use crate::{root_ca_certificate, util::get_row_range_from_prefix};
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::{
     bigtable_client::BigtableClient, MutateRowRequest, MutateRowResponse, MutateRowsRequest,
@@ -285,6 +286,7 @@ pub struct BigTableConnection {
     table_prefix: Arc<String>,
     instance_prefix: Arc<String>,
     timeout: Arc<Option<Duration>>,
+    retry_policy: Option<RetryPolicy>,
 }
 
 impl BigTableConnection {
@@ -414,6 +416,7 @@ impl BigTableConnection {
                     table_prefix: Arc::new(table_prefix),
                     instance_prefix: Arc::new(instance_prefix),
                     timeout: Arc::new(timeout),
+                    retry_policy: None,
                 })
             }
         }
@@ -494,6 +497,7 @@ impl BigTableConnection {
                 project_id, instance_name
             )),
             timeout: Arc::new(timeout),
+            retry_policy: None,
         })
     }
 
@@ -507,6 +511,7 @@ impl BigTableConnection {
             instance_prefix: self.instance_prefix.clone(),
             table_prefix: self.table_prefix.clone(),
             timeout: self.timeout.clone(),
+            retry_policy: self.retry_policy.clone(),
         }
     }
 
@@ -516,6 +521,12 @@ impl BigTableConnection {
         config_fn: fn(BigtableClient<AuthSvc>) -> BigtableClient<AuthSvc>,
     ) {
         self.client = config_fn(self.client.clone());
+    }
+
+    /// Set this to `Some` to let the client automatically retry in case
+    /// of failure. This comes at the cost of cloning.
+    pub fn set_retry_policy(&mut self, policy: Option<RetryPolicy>) {
+        self.retry_policy = policy;
     }
 }
 
@@ -562,18 +573,68 @@ pub struct BigTable {
     instance_prefix: Arc<String>,
     table_prefix: Arc<String>,
     timeout: Arc<Option<Duration>>,
+    retry_policy: Option<RetryPolicy>,
 }
 
 impl BigTable {
+    /// Helper to run actions with a potential retry upon failure
+    async fn with_retry<F, A, R>(&mut self, f: F, a: A) -> std::result::Result<R, tonic::Status>
+    where
+        A: Clone,
+        F: for<'b> AsyncFn(
+            &'b mut BigtableClient<AuthSvc>,
+            A,
+        ) -> std::result::Result<R, tonic::Status>,
+    {
+        if let Some(retry_policy) = &self.retry_policy {
+            self.retry_loop(retry_policy.clone(), f, a).await
+        } else {
+            // No retry, so no cloning needed
+            f(&mut self.client, a).await
+        }
+    }
+
+    /// Retry loop with backoff policy
+    async fn retry_loop<F, A, R>(
+        &mut self,
+        mut retry_policy: RetryPolicy,
+        f: F,
+        a: A,
+    ) -> std::result::Result<R, tonic::Status>
+    where
+        A: Clone,
+        F: for<'b> AsyncFn(
+            &'b mut BigtableClient<AuthSvc>,
+            A,
+        ) -> std::result::Result<R, tonic::Status>,
+    {
+        let r = f(&mut self.client, a.clone()).await;
+        match r {
+            Ok(r) => Ok(r),
+            Err(e) => match retry_policy.next_backoff(e.code()) {
+                Some(d) => {
+                    tokio::time::sleep(d).await;
+                    Box::pin(self.retry_loop(retry_policy, f, a)).await
+                }
+                None => Err(e),
+            },
+        }
+    }
+
     /// Wrapped `check_and_mutate_row` method
     pub async fn check_and_mutate_row(
         &mut self,
         request: CheckAndMutateRowRequest,
     ) -> Result<CheckAndMutateRowResponse> {
-        let tonic_req = Self::add_routing_header(request.into_request())?;
         let response = self
-            .client
-            .check_and_mutate_row(tonic_req)
+            .with_retry(
+                async |client, request: CheckAndMutateRowRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.check_and_mutate_row(tonic_req).await
+                },
+                request,
+            )
             .await?
             .into_inner();
         Ok(response)
@@ -584,8 +645,17 @@ impl BigTable {
         &mut self,
         request: ReadRowsRequest,
     ) -> Result<Vec<(RowKey, Vec<RowCell>)>> {
-        let tonic_req = Self::add_routing_header(request.into_request())?;
-        let response = self.client.read_rows(tonic_req).await?.into_inner();
+        let response = self
+            .with_retry(
+                async |client, request: ReadRowsRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.read_rows(tonic_req).await
+                },
+                request,
+            )
+            .await?
+            .into_inner();
         decode_read_rows_response(self.timeout.as_ref(), response).await
     }
 
@@ -601,8 +671,17 @@ impl BigTable {
             row_ranges: vec![row_range],
         });
 
-        let tonic_req = Self::add_routing_header(request.into_request())?;
-        let response = self.client.read_rows(tonic_req).await?.into_inner();
+        let response = self
+            .with_retry(
+                async |client, request: ReadRowsRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.read_rows(tonic_req).await
+                },
+                request,
+            )
+            .await?
+            .into_inner();
         decode_read_rows_response(self.timeout.as_ref(), response).await
     }
 
@@ -611,8 +690,17 @@ impl BigTable {
         &mut self,
         request: ReadRowsRequest,
     ) -> Result<impl Stream<Item = Result<(RowKey, Vec<RowCell>)>>> {
-        let tonic_req = Self::add_routing_header(request.into_request())?;
-        let response = self.client.read_rows(tonic_req).await?.into_inner();
+        let response = self
+            .with_retry(
+                async |client, request: ReadRowsRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.read_rows(tonic_req).await
+                },
+                request,
+            )
+            .await?
+            .into_inner();
         let stream = decode_read_rows_response_stream(response).await;
         Ok(stream)
     }
@@ -629,8 +717,17 @@ impl BigTable {
             row_ranges: vec![row_range],
         });
 
-        let tonic_req = Self::add_routing_header(request.into_request())?;
-        let response = self.client.read_rows(tonic_req).await?.into_inner();
+        let response = self
+            .with_retry(
+                async |client, request: ReadRowsRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.read_rows(tonic_req).await
+                },
+                request,
+            )
+            .await?
+            .into_inner();
         let stream = decode_read_rows_response_stream(response).await;
         Ok(stream)
     }
@@ -640,8 +737,17 @@ impl BigTable {
         &mut self,
         request: SampleRowKeysRequest,
     ) -> Result<Streaming<SampleRowKeysResponse>> {
-        let tonic_req = Self::add_routing_header(request.into_request())?;
-        let response = self.client.sample_row_keys(tonic_req).await?.into_inner();
+        let response = self
+            .with_retry(
+                async |client, request: SampleRowKeysRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.sample_row_keys(tonic_req).await
+                },
+                request,
+            )
+            .await?
+            .into_inner();
         Ok(response)
     }
 
@@ -650,8 +756,16 @@ impl BigTable {
         &mut self,
         request: MutateRowRequest,
     ) -> Result<Response<MutateRowResponse>> {
-        let tonic_req = Self::add_routing_header(request.into_request())?;
-        let response = self.client.mutate_row(tonic_req).await?;
+        let response = self
+            .with_retry(
+                async |client, request: MutateRowRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.mutate_row(tonic_req).await
+                },
+                request,
+            )
+            .await?;
         Ok(response)
     }
 
@@ -660,8 +774,17 @@ impl BigTable {
         &mut self,
         request: MutateRowsRequest,
     ) -> Result<Streaming<MutateRowsResponse>> {
-        let tonic_req = Self::add_routing_header(request.into_request())?;
-        let response = self.client.mutate_rows(tonic_req).await?.into_inner();
+        let response = self
+            .with_retry(
+                async |client, request: MutateRowsRequest| {
+                    let tonic_req = Self::add_routing_header(request.into_request())
+                        .map_err(|e| tonic::Status::internal(e.to_string()))?;
+                    client.mutate_rows(tonic_req).await
+                },
+                request,
+            )
+            .await?
+            .into_inner();
         Ok(response)
     }
 
