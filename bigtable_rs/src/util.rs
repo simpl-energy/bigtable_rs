@@ -1,5 +1,11 @@
-use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_range::{EndKey, StartKey};
+use std::time::Duration;
+
+use backoff::ExponentialBackoff;
+use backoff::backoff::Backoff;
+use tonic::Code;
+
 use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::RowRange;
+use googleapis_tonic_google_bigtable_v2::google::bigtable::v2::row_range::{EndKey, StartKey};
 
 pub fn get_row_range_from_prefix(prefix: Vec<u8>) -> RowRange {
     let end_key = get_end_key_for_prefix(prefix.as_ref()).map(EndKey::EndKeyOpen);
@@ -31,6 +37,22 @@ fn get_end_key_for_prefix(start_key: &[u8]) -> Option<Vec<u8>> {
     }
 
     Some(vector)
+}
+
+#[derive(Clone)]
+pub struct RetryPolicy {
+    pub backoff: ExponentialBackoff,
+    pub should_retry: fn(Code) -> bool,
+}
+
+impl RetryPolicy {
+    pub fn next_backoff(&mut self, code: Code) -> Option<Duration> {
+        if !(self.should_retry)(code) {
+            None
+        } else {
+            self.backoff.next_backoff()
+        }
+    }
 }
 
 #[cfg(test)]
