@@ -91,6 +91,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use backoff::backoff::Backoff;
 use futures_util::Stream;
 use gcp_auth::TokenProvider;
 use log::info;
@@ -587,7 +588,11 @@ impl BigTable {
         ) -> std::result::Result<R, tonic::Status>,
     {
         if let Some(retry_policy) = &self.retry_policy {
-            self.retry_loop(retry_policy.clone(), f, a).await
+            // We have a retry policy, make sure to reset the policy
+            // before going entering the loop.
+            let mut retry_policy = retry_policy.clone();
+            retry_policy.backoff.reset();
+            self.retry_loop(retry_policy, f, a).await
         } else {
             // No retry, so no cloning needed
             f(&mut self.client, a).await
