@@ -46,11 +46,10 @@ pub struct RetryPolicy {
 }
 
 impl RetryPolicy {
-    pub fn next_backoff(&mut self, code: Code) -> Option<Duration> {
-        if !(self.should_retry)(code) {
-            None
-        } else {
-            self.backoff.next_backoff()
+    pub fn next_backoff(&mut self, code: Option<Code>) -> Option<Duration> {
+        match code {
+            Some(code) if (self.should_retry)(code) => self.backoff.next_backoff(),
+            _ => None,
         }
     }
 }

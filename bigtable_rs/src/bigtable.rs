@@ -96,13 +96,13 @@ use gcp_auth::TokenProvider;
 use log::info;
 use thiserror::Error;
 use tokio::net::UnixStream;
+use tonic::IntoRequest;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Endpoint;
-use tonic::IntoRequest;
 use tonic::{
-    codec::Streaming,
-    transport::{channel::Change, Channel, ClientTlsConfig},
     Response,
+    codec::Streaming,
+    transport::{Channel, ClientTlsConfig, channel::Change},
 };
 use tower::ServiceBuilder;
 
@@ -493,13 +493,14 @@ pub struct BigTable {
 
 impl BigTable {
     /// Helper to run actions with a potential retry upon failure
-    async fn with_retry<F, A, R>(&mut self, f: F, a: A) -> std::result::Result<R, tonic::Status>
+    async fn with_retry<F, A, R>(&mut self, f: F, a: A) -> std::result::Result<R, Error>
     where
         A: Clone,
         F: for<'b> AsyncFn(
             &'b mut BigtableClient<AuthSvc>,
             A,
-        ) -> std::result::Result<R, tonic::Status>,
+            &Option<Duration>,
+        ) -> std::result::Result<R, Error>,
     {
         if let Some(retry_policy) = &self.retry_policy {
             // We have a retry policy, make sure to reset the policy
@@ -509,7 +510,7 @@ impl BigTable {
             self.retry_loop(retry_policy, f, a).await
         } else {
             // No retry, so no cloning needed
-            f(&mut self.client, a).await
+            f(&mut self.client, a, self.timeout.as_ref()).await
         }
     }
 
@@ -519,24 +520,31 @@ impl BigTable {
         mut retry_policy: RetryPolicy,
         f: F,
         a: A,
-    ) -> std::result::Result<R, tonic::Status>
+    ) -> std::result::Result<R, Error>
     where
         A: Clone,
         F: for<'b> AsyncFn(
             &'b mut BigtableClient<AuthSvc>,
             A,
-        ) -> std::result::Result<R, tonic::Status>,
+            &Option<Duration>,
+        ) -> std::result::Result<R, Error>,
     {
-        let r = f(&mut self.client, a.clone()).await;
+        let r = f(&mut self.client, a.clone(), self.timeout.as_ref()).await;
         match r {
             Ok(r) => Ok(r),
-            Err(e) => match retry_policy.next_backoff(e.code()) {
-                Some(d) => {
-                    tokio::time::sleep(d).await;
-                    Box::pin(self.retry_loop(retry_policy, f, a)).await
+            Err(e) => {
+                let code = match e {
+                    Error::RpcError(ref c) => Some(c.code()),
+                    _ => None,
+                };
+                match retry_policy.next_backoff(code) {
+                    Some(d) => {
+                        tokio::time::sleep(d).await;
+                        Box::pin(self.retry_loop(retry_policy, f, a)).await
+                    }
+                    None => Err(e),
                 }
-                None => Err(e),
-            },
+            }
         }
     }
 
@@ -545,11 +553,14 @@ impl BigTable {
         &mut self,
         request: CheckAndMutateRowRequest,
     ) -> Result<CheckAndMutateRowResponse> {
-        let response = self
-            .with_retry(BigtableClient::check_and_mutate_row, request)
-            .await?
-            .into_inner();
-        Ok(response)
+        self.with_retry(
+            async |client, request, _timeout| {
+                let response = client.check_and_mutate_row(request).await?.into_inner();
+                Ok(response)
+            },
+            request,
+        )
+        .await
     }
 
     /// Wrapped `read_rows` method
@@ -557,11 +568,14 @@ impl BigTable {
         &mut self,
         request: ReadRowsRequest,
     ) -> Result<Vec<(RowKey, Vec<RowCell>)>> {
-        let response = self
-            .with_retry(BigtableClient::read_rows, request)
-            .await?
-            .into_inner();
-        decode_read_rows_response(self.timeout.as_ref(), response).await
+        self.with_retry(
+            async |client, request, timeout| {
+                let response = client.read_rows(request).await?.into_inner();
+                decode_read_rows_response(timeout, response).await
+            },
+            request,
+        )
+        .await
     }
 
     /// Provide `read_rows_with_prefix` method to allow using a prefix as key
@@ -575,11 +589,14 @@ impl BigTable {
             row_keys: vec![], // use this field to put keys for reading specific rows
             row_ranges: vec![row_range],
         });
-        let response = self
-            .with_retry(BigtableClient::read_rows, request)
-            .await?
-            .into_inner();
-        decode_read_rows_response(self.timeout.as_ref(), response).await
+        self.with_retry(
+            async |client, request, timeout| {
+                let response = client.read_rows(request).await?.into_inner();
+                decode_read_rows_response(timeout, response).await
+            },
+            request,
+        )
+        .await
     }
 
     /// Streaming support for `read_rows` method
@@ -587,12 +604,15 @@ impl BigTable {
         &mut self,
         request: ReadRowsRequest,
     ) -> Result<impl Stream<Item = Result<(RowKey, Vec<RowCell>)>>> {
-        let response = self
-            .with_retry(BigtableClient::read_rows, request)
-            .await?
-            .into_inner();
-        let stream = decode_read_rows_response_stream(response).await;
-        Ok(stream)
+        self.with_retry(
+            async |client, request, _timeout| {
+                let response = client.read_rows(request).await?.into_inner();
+                let stream = decode_read_rows_response_stream(response).await;
+                Ok(stream)
+            },
+            request,
+        )
+        .await
     }
 
     /// Streaming support for `read_rows_with_prefix` method
@@ -606,12 +626,15 @@ impl BigTable {
             row_keys: vec![],
             row_ranges: vec![row_range],
         });
-        let response = self
-            .with_retry(BigtableClient::read_rows, request)
-            .await?
-            .into_inner();
-        let stream = decode_read_rows_response_stream(response).await;
-        Ok(stream)
+        self.with_retry(
+            async |client, request, _timeout| {
+                let response = client.read_rows(request).await?.into_inner();
+                let stream = decode_read_rows_response_stream(response).await;
+                Ok(stream)
+            },
+            request,
+        )
+        .await
     }
 
     /// Wrapped `sample_row_keys` method
@@ -619,11 +642,14 @@ impl BigTable {
         &mut self,
         request: SampleRowKeysRequest,
     ) -> Result<Streaming<SampleRowKeysResponse>> {
-        let response = self
-            .with_retry(BigtableClient::sample_row_keys, request)
-            .await?
-            .into_inner();
-        Ok(response)
+        self.with_retry(
+            async |client, request, _timeout| {
+                let response = client.sample_row_keys(request).await?.into_inner();
+                Ok(response)
+            },
+            request,
+        )
+        .await
     }
 
     /// Wrapped `mutate_row` method
@@ -631,8 +657,14 @@ impl BigTable {
         &mut self,
         request: MutateRowRequest,
     ) -> Result<Response<MutateRowResponse>> {
-        let response = self.with_retry(BigtableClient::mutate_row, request).await?;
-        Ok(response)
+        self.with_retry(
+            async |client, request, _timeout| {
+                let response = client.mutate_row(request).await?;
+                Ok(response)
+            },
+            request,
+        )
+        .await
     }
 
     /// Wrapped `mutate_rows` method
@@ -640,11 +672,14 @@ impl BigTable {
         &mut self,
         request: MutateRowsRequest,
     ) -> Result<Streaming<MutateRowsResponse>> {
-        let response = self
-            .with_retry(BigtableClient::mutate_rows, request)
-            .await?
-            .into_inner();
-        Ok(response)
+        self.with_retry(
+            async |client, request, _timeout| {
+                let response = client.mutate_rows(request).await?.into_inner();
+                Ok(response)
+            },
+            request,
+        )
+        .await
     }
 
     /// Wrapped `execute_query` method
